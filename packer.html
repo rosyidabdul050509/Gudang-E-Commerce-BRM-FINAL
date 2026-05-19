@@ -198,39 +198,135 @@ let cameraActive=false;
 let codeReader=null;
 let camStream=null;
 let lastScan='';let lastScanTime=0;
+let apiUrl='';
+let masterData={};
+let selesaiIds=[];
 
 // ── INIT ──────────────────────────────────────────────
 window.addEventListener('load',()=>{
-  const saved=localStorage.getItem('brm_packer_name');
-  if(saved)document.getElementById('packer-name').value=saved;
-  loadAntrian();
+  // Reset selesai IDs kalau hari baru
+  const lastDay=localStorage.getItem('brm_last_day');
+  const todayD=new Date().toISOString().split('T')[0];
+  if(lastDay!==todayD){localStorage.removeItem('brm_selesai_ids');localStorage.setItem('brm_last_day',todayD);}
+
+  const savedName=localStorage.getItem('brm_packer_name');
+  if(savedName)document.getElementById('packer-name').value=savedName;
+  const savedUrl=localStorage.getItem('brm_api_url');
+  if(savedUrl){apiUrl=savedUrl;loadAntrian();}
+  else showUrlPrompt();
+  selesaiIds=JSON.parse(localStorage.getItem('brm_selesai_ids')||'[]');
 });
 
 function savePacker(){localStorage.setItem('brm_packer_name',document.getElementById('packer-name').value);}
 function getPackerName(){return document.getElementById('packer-name').value.trim()||'Packer';}
 
-// ── ANTRIAN ───────────────────────────────────────────
-function getAntrian(){try{return JSON.parse(localStorage.getItem('brm_antrian')||'[]');}catch(e){return[];}}
-function saveAntrianData(a){localStorage.setItem('brm_antrian',JSON.stringify(a));}
+function showUrlPrompt(){
+  const el=document.getElementById('antrian-list');
+  el.innerHTML=`<div class="empty-state">
+    <div class="empty-icon">🔗</div>
+    <div class="empty-text" style="margin-bottom:16px">Masukkan URL Google Apps Script<br>untuk menghubungkan ke data admin</div>
+    <input type="text" id="url-input" placeholder="https://script.google.com/macros/s/..." 
+      style="width:100%;padding:12px;border-radius:8px;border:2px solid var(--border2);background:var(--bg3);color:var(--text);font-size:13px;outline:none;margin-bottom:10px">
+    <button class="btn-pack" onclick="saveUrl()" style="background:var(--accent)">Hubungkan</button>
+  </div>`;
+}
 
-function loadAntrian(){
-  const antrian=getAntrian();
+async function saveUrl(){
+  const val=document.getElementById('url-input')?.value.trim();
+  if(!val)return;
+  // Test connection
+  const el=document.getElementById('antrian-list');
+  el.innerHTML=`<div class="empty-state"><div class="empty-icon">⏳</div><div class="empty-text">Menghubungkan...</div></div>`;
+  try{
+    const r=await fetch(val+'?action=ping');
+    const d=await r.json();
+    if(d.status==='ok'){
+      apiUrl=val;
+      localStorage.setItem('brm_api_url',val);
+      loadAntrian();
+    } else {
+      throw new Error(d.message||'Gagal');
+    }
+  } catch(e){
+    el.innerHTML=`<div class="empty-state"><div class="empty-icon">❌</div><div class="empty-text">Gagal terhubung: ${e.message}<br><br><button class="btn-pack" onclick="showUrlPrompt()" style="background:var(--red-dim);color:var(--red);border:1px solid var(--red)">Coba Lagi</button></div></div>`;
+  }
+}
+
+// ── ANTRIAN — ambil dari DB Keluar hari ini ───────────
+async function loadAntrian(){
   const el=document.getElementById('antrian-list');
   const stats=document.getElementById('antrian-stats');
-  const menunggu=antrian.filter(a=>a.status==='menunggu');
-  const selesai=antrian.filter(a=>a.status==='selesai'&&a.selesaiAt&&a.selesaiAt.startsWith(new Date().toISOString().split('T')[0]));
+  el.innerHTML=`<div class="empty-state"><div class="empty-icon">⏳</div><div class="empty-text">Memuat data dari server...</div></div>`;
 
-  stats.innerHTML=`
-    <span class="badge badge-amber" style="font-size:12px;padding:5px 12px">${menunggu.length} Menunggu</span>
-    <span class="badge badge-green" style="font-size:12px;padding:5px 12px">${selesai.length} Selesai Hari Ini</span>`;
+  try{
+    // Ambil semua data dari Sheets
+    const r=await fetch(apiUrl+'?action=getAll');
+    const d=await r.json();
 
-  if(!menunggu.length){
-    el.innerHTML=`<div class="empty-state"><div class="empty-icon">📭</div><div class="empty-text">Belum ada pesanan dalam antrian.<br>Admin belum input pesanan hari ini.</div></div>`;
-    return;
-  }
+    // Simpan master SKU untuk barcode lookup
+    masterData={};
+    if(d.master){
+      d.master.forEach(row=>{
+        const k=(Array.isArray(row)?row[0]:row.varianSKU||'').toString().trim().toUpperCase().replace(/\s+/g,'');
+        if(!k)return;
+        if(!masterData[k])masterData[k]=[];
+        masterData[k].push({
+          sku:(Array.isArray(row)?row[1]:row.sku)||'',
+          nama:(Array.isArray(row)?row[2]:row.namaBarang)||'',
+          qty:Number(Array.isArray(row)?row[3]:row.qty)||1,
+          barcode:((Array.isArray(row)?row[4]:row.Barcode||row.barcode||'')||'').toString().trim()
+        });
+      });
+    }
 
-  el.innerHTML=menunggu.map(a=>`
-    <div class="antrian-card" onclick="openPack('${a.id}')">
+    // Filter DB Keluar hari ini, belum selesai
+    const todayStr=new Date().toISOString().split('T')[0];
+    const dbK=d.dbK||[];
+    const todayRows=dbK.filter(r=>{
+      const tgl=r.tanggal||r.Tanggal||'';
+      return tgl===todayStr||tgl.startsWith(todayStr);
+    });
+
+    // Group by resi/noPesanan
+    const groups={};
+    todayRows.forEach(r=>{
+      const key=(r.resi||r.noPesanan||'').toString().trim();
+      if(!key)return;
+      if(!groups[key])groups[key]={
+        id:'PKG-'+key,
+        resi:key,
+        noPesanan:r.noPesanan||key,
+        tanggal:r.tanggal||todayStr,
+        gudang:r.gudang||'',
+        ekspedisi:r.ekspedisi||'',
+        platform:r.platform||'',
+        items:[]
+      };
+      // Cari barcode dari master
+      const skuKey=(r.sku||'').toString().trim().toUpperCase().replace(/\s+/g,'');
+      const masterItems=masterData[skuKey]||[];
+      const barcode=masterItems[0]?.barcode||'';
+      groups[key].items.push({sku:r.sku||'',nama:r.nama||'',qty:Number(r.qty)||1,barcode});
+    });
+
+    // Filter yang belum selesai
+    const selesai=JSON.parse(localStorage.getItem('brm_selesai_ids')||'[]');
+    const menunggu=Object.values(groups).filter(g=>!selesai.includes(g.id));
+    const sdSelesai=Object.values(groups).filter(g=>selesai.includes(g.id));
+
+    stats.innerHTML=`
+      <span class="badge badge-amber" style="font-size:12px;padding:5px 12px">${menunggu.length} Menunggu</span>
+      <span class="badge badge-green" style="font-size:12px;padding:5px 12px">${sdSelesai.length} Selesai Hari Ini</span>
+      <span style="font-size:11px;color:var(--text3);font-family:'DM Mono',monospace;padding:4px 0">Data: ${todayStr}</span>`;
+
+    if(!menunggu.length){
+      el.innerHTML=`<div class="empty-state"><div class="empty-icon">📭</div><div class="empty-text">${todayRows.length===0?'Admin belum input pesanan hari ini.':'Semua pesanan hari ini sudah selesai dipack! 🎉'}</div></div>`;
+      return;
+    }
+
+  el.innerHTML=menunggu.map(a=>{
+    const enc=encodeURIComponent(JSON.stringify(a));
+    return`<div class="antrian-card">
       <div style="display:flex;justify-content:space-between;align-items:flex-start">
         <div style="flex:1">
           <div class="antrian-id">${a.id} · ${a.tanggal}</div>
@@ -240,9 +336,15 @@ function loadAntrian(){
         <span class="badge badge-amber">Menunggu</span>
       </div>
       <div class="antrian-items">${a.items.map(it=>`<span class="antrian-item-chip">${it.sku} ×${it.qty}</span>`).join('')}</div>
-      <button class="btn-pack" onclick="event.stopPropagation();openPack('${a.id}')">📦 Mulai Pack</button>
-    </div>`).join('');
+      <button class="btn-pack" onclick="openPackData('${enc}')">📦 Mulai Pack</button>
+    </div>`;}).join('');
+
+  } catch(e){
+    el.innerHTML=`<div class="empty-state"><div class="empty-icon">❌</div><div class="empty-text">Gagal memuat: ${e.message}<br><br><button class="btn-pack" onclick="loadAntrian()">↻ Coba Lagi</button><br><br><button class="btn-pack" onclick="resetUrl()" style="background:var(--bg3);color:var(--text2);border:1px solid var(--border);margin-top:8px">Ganti URL</button></div></div>`;
+  }
 }
+
+function resetUrl(){localStorage.removeItem('brm_api_url');apiUrl='';showUrlPrompt();}
 
 function showScreen(id){
   document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
@@ -258,18 +360,16 @@ function backToList(){
   loadAntrian();
 }
 
-// ── PACK SCREEN ───────────────────────────────────────
-function openPack(id){
-  const antrian=getAntrian();
-  const pkg=antrian.find(a=>a.id===id);
-  if(!pkg)return;
-  currentPkg=pkg;
-  // Init packItems with scanned=0
-  packItems=pkg.items.map(it=>({...it,scanned:0}));
-  document.getElementById('pack-resi-title').textContent=pkg.resi;
-  document.getElementById('pack-sub-title').textContent=pkg.gudang+(pkg.ekspedisi?' · '+pkg.ekspedisi:'');
-  renderPackContent();
-  showScreen('pack');
+function openPackData(enc){
+  try{
+    const pkg=JSON.parse(decodeURIComponent(enc));
+    currentPkg=pkg;
+    packItems=pkg.items.map(it=>({...it,scanned:0}));
+    document.getElementById('pack-resi-title').textContent=pkg.resi;
+    document.getElementById('pack-sub-title').textContent=(pkg.gudang||'')+(pkg.ekspedisi?' · '+pkg.ekspedisi:'');
+    renderPackContent();
+    showScreen('pack');
+  }catch(e){alert('Error: '+e.message);}
 }
 
 function renderPackContent(){
@@ -480,14 +580,10 @@ function selesaiPack(){
   if(!currentPkg)return;
   if(!packItems.every(p=>p.scanned>=p.qty)){showAlert('danger','Belum semua item di-scan!');return;}
   stopCamera();
-  const antrian=getAntrian();
-  const idx=antrian.findIndex(a=>a.id===currentPkg.id);
-  if(idx>=0){
-    antrian[idx].status='selesai';
-    antrian[idx].selesaiAt=new Date().toISOString();
-    antrian[idx].packerName=getPackerName();
-    saveAntrianData(antrian);
-  }
+  // Tandai sebagai selesai di localStorage
+  const ids=JSON.parse(localStorage.getItem('brm_selesai_ids')||'[]');
+  if(!ids.includes(currentPkg.id))ids.push(currentPkg.id);
+  localStorage.setItem('brm_selesai_ids',JSON.stringify(ids));
   document.getElementById('done-sub').textContent='Pesanan '+currentPkg.resi+' berhasil dipack oleh '+getPackerName();
   showScreen('done');
   vibrate([100,50,100,50,200]);
